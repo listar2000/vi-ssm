@@ -10,6 +10,25 @@ from autograd.misc.optimizers import adam
 from classic_vsmc import *
 
 
+def init_neural_net_params(input_size, hidden_size, output_size, rs=npr.RandomState(0)):
+    W1 = rs.randn(input_size, hidden_size) * 0.01
+    b1 = np.zeros(hidden_size)
+    W2 = rs.randn(hidden_size, hidden_size) * 0.01
+    b2 = np.zeros(hidden_size)
+    W3 = rs.randn(hidden_size, output_size) * 0.01
+    b3 = np.zeros(output_size)
+    return [(W1, b1), (W2, b2), (W3, b3)]
+
+def relu(x):
+    return np.maximum(x, 0)
+
+def neural_net_predict(params, comb_x):
+    for W, b in params[:-1]:
+        comb_x = np.dot(comb_x, W) + b
+        comb_x = relu(comb_x)  # Applying ReLU activation
+    out_W, out_b = params[-1]
+    return np.dot(comb_x, out_W) + out_b
+
 def init_model_params(Dx, Dy, alpha, r, obs, rs=npr.RandomState(0)):
     mu0 = np.zeros(Dx)
     Sigma0 = np.eye(Dx)
@@ -104,16 +123,11 @@ class lgss_smc:
         return log_norm - 0.5 * np.sum((x - mu) * np.dot(Prec, (x - mu).T).T, axis=1)
 
     def log_prop(self, t, Xc, Xp, y, prop_params, model_params):
-        mu0, Sigma0, A, Q, C, R = model_params
-        mut, lint, log_s2t = prop_params[t]
-        s2t = np.exp(log_s2t)
-
-        if t > 0:
-            mu = mut + np.dot(A, Xp.T).T * lint
-        else:
-            mu = mut + lint * mu0
-        print("hello", mu.shape)
-        assert False
+        mean_params, sigma_params = prop_params[0], prop_params[1]
+        t_column = np.full((Xp.shape[0], 1), t)
+        comb_x = np.concatenate((Xp, t_column), axis=1)
+        mu = neural_net_predict(mean_params, comb_x)
+        s2t = np.exp(neural_net_predict(sigma_params, t)[0])
         return self.log_normal(Xc, mu, np.diag(s2t))
 
     def log_target(self, t, Xc, Xp, y, prop_params, model_params):
@@ -131,14 +145,12 @@ class lgss_smc:
                self.log_prop(t, Xc, Xp, y, prop_params, model_params)
 
     def sim_prop(self, t, Xp, y, prop_params, model_params, rs=npr.RandomState(0)):
-        mu0, Sigma0, A, Q, C, R = model_params
-        mut, lint, log_s2t = prop_params[t]
-        s2t = np.exp(log_s2t)
-
-        if t > 0:
-            mu = mut + np.dot(A, Xp.T).T * lint
-        else:
-            mu = mut + lint * mu0
+        # mu0, Sigma0, A, Q, C, R = model_params
+        mean_params, sigma_params = prop_params[0], prop_params[1]
+        t_column = np.full((Xp.shape[0], 1), t)
+        comb_x = np.concatenate((Xp, t_column), axis=1)
+        mu = neural_net_predict(mean_params, comb_x)
+        s2t = np.exp(neural_net_predict(sigma_params, t)[0])
         return mu + rs.randn(*Xp.shape) * np.sqrt(s2t)
 
 
@@ -157,18 +169,17 @@ def train_vsmc_lgss(T, Dx, Dy, alpha, r, N, obs, seed_n):
     lml = log_marginal_likelihood(model_params, T, y_true)
     print("True log-marginal likelihood: " + str(lml))
 
-    seed = npr.RandomState(seed_n)
+    seed = npr.RandomState(2023)
 
-    # Initialize proposal parameters
-    prop_params = init_prop_params(T, Dx, param_scale, seed)
-    combined_init_params = (model_params, prop_params)
+    # Initialize proposal parameters; +1 for the time feature
+    mean_params = init_neural_net_params(Dx + 1, 32, Dx)
+    sigma_params = init_neural_net_params(1, 32, Dx)
+    prop_params = [mean_params, sigma_params]
 
     lgss_smc_obj = lgss_smc(T, Dx, Dy, N)
 
-
     # Define training objective
-    def objective(combined_params, iter):
-        model_params, prop_params = combined_params
+    def objective(prop_params, iter):
         return -vsmc_lower_bound(prop_params, model_params, y_true, lgss_smc_obj, seed)
 
 
@@ -176,27 +187,22 @@ def train_vsmc_lgss(T, Dx, Dy, alpha, r, N, obs, seed_n):
     objective_grad = grad(objective)
 
     print("     Epoch     |    ELBO  ")
-    f_head = './lgss_vsmc_biased_T' + str(T) + '_N' + str(N) + '_step' + str(step_size)
-    with open(f_head + '_ELBO.csv', 'w') as f_handle:
-        f_handle.write("iter,ELBO\n")
 
     elbos = []
-    def print_perf(combined_params, iter, grad):
+    def print_perf(prop_params, iter, grad):
         if iter % 10 == 0:
-            model_params, prop_params = combined_params
-            bound = -objective(combined_params, iter)
+            bound = -objective(prop_params, iter)
             message = "{:15}|{:20}".format(iter, bound)
-
-            # with open(f_head + '_ELBO.csv', 'a') as f_handle:
-            #     np.savetxt(f_handle, [[iter, bound]], fmt='%i,%f')
             elbos.append(bound)
-
             print(message)
+
+
     # SGD with adaptive step-size "adam"
-    optimized_params = adam(objective_grad, combined_init_params, step_size=step_size,
+    optimized_params = adam(objective_grad, prop_params, step_size=step_size,
                             num_iters=num_epochs, callback=print_perf)
     # opt_model_params, opt_prop_params = optimized_params
     return elbos
+
 
 if __name__ == '__main__':
     # Model hyper-parameters
@@ -210,7 +216,7 @@ if __name__ == '__main__':
 
     for i in range(len(Dxs)):
         Dx, Dy, obs = Dxs[i], Dys[i], obss[i]
-        name = f"data/lgss_Dx_{Dx}_Dy_{Dy}.csv"
+        name = f"data/lgss_nn_Dx_{Dx}_Dy_{Dy}.csv"
         elbo_lists = []
         for j in range(10):
             elbo_lists.append(train_vsmc_lgss(T, Dx, Dy, alpha, r, N, obs, 2020 + j))
